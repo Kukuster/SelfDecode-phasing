@@ -61,10 +61,10 @@ log.addHandler(debug_handler)
 def rand_str(length:int=10):
     return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(length))
 
-sample_dist       = lambda adist: pyro.sample(rand_str(), adist)
-shape_dist        = lambda adist: pyro.sample(rand_str(), adist).shape
-sample_dist_infer = lambda adist: pyro.sample(rand_str(), adist, infer={"enumerate": "parallel"})
-shape_dist_infer  = lambda adist: pyro.sample(rand_str(), adist, infer={"enumerate": "parallel"}).shape
+_sample_dist       = lambda adist: pyro.sample(rand_str(), adist)
+_shape_dist        = lambda adist: pyro.sample(rand_str(), adist).shape
+_sample_dist_infer = lambda adist: pyro.sample(rand_str(), adist, infer={"enumerate": "parallel"})
+_shape_dist_infer  = lambda adist: pyro.sample(rand_str(), adist, infer={"enumerate": "parallel"}).shape
 
 Cate = dist.Categorical # type: ignore # "Categorical" *is* a known member of module dist
 Bern = dist.Bernoulli # type: ignore # "Bernoulli" *is* a known member of module dist
@@ -267,13 +267,11 @@ def model_3(sequences, lengths, args, batch_size=None, include_prior=True, train
 # kukedits:
 # made work for a reduced shape of the data: for only 1 tone out of 88
 def model_31(sequences, lengths, args, batch_size=None, include_prior=True, training:bool=True):
-    with ignore_jit_warnings():
-        num_sequences, max_length = map(int, sequences.shape)
-        assert lengths.shape == (num_sequences,)
-        assert lengths.max() <= max_length
+
     # corresponds to number of possible indices for probs_w and probs_x
     #         and to number of possible values of w and x vars
     hidden_dim = 2   # for both w and x can be 0 and 1
+
     observed_dim = 4 # can be 0 (unknown), 1 (0/0), 2 (0/1), 3 (1/1)
     with poutine.mask(mask=include_prior):
         probs_w = pyro.sample(
@@ -290,32 +288,81 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, trai
     w_list = []
     x_list = []
     y_list = []
-    # tones_plate = pyro.plate("tones", data_dim, dim=-1)
-    with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
-        lengths = lengths[batch]
-        w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
-        for t in pyro.markov(range(max_length if args.jit else lengths.max())): # type: ignore # "Dirichlet" *is* a known member of module dist
-            with poutine.mask(mask=(t < lengths)):
-                w = pyro.sample(
-                    "w_{}".format(t),
-                    dist.Categorical(probs_w[w]), # type: ignore # "Categorical" *is* a known member of module dist
-                    infer={"enumerate": "parallel"},
-                )
-                w_list.append(w)
-                x = pyro.sample(
-                    "x_{}".format(t),
-                    dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
-                    infer={"enumerate": "parallel"},
-                )
-                x_list.append(x)
-                y = pyro.sample(
-                    "y_{}".format(t),
-                    dist.Categorical(probs_y[w, x]), # type: ignore # "Bernoulli" *is* a known member of module dist
-                    obs=sequences[batch, t],
-                )
-                y_list.append(y)
+    batches = []
 
-    return w_list, x_list, y_list
+    def train_on(full_sequences, lengths):
+        assert len(sequences.shape) == 3
+        with ignore_jit_warnings():
+            num_sequences, max_length, num_calls = map(int, sequences.shape)
+            assert num_calls == 2, "there should be 2 calls per each site"
+            assert lengths.shape == (num_sequences,)
+            assert lengths.max() <= max_length
+
+        with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
+            batches.append(batch)
+            lengths = lengths[batch]
+            w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
+            for t in pyro.markov(range(max_length if args.jit else lengths.max())): # type: ignore # "Dirichlet" *is* a known member of module dist
+                with poutine.mask(mask=(t < lengths)):
+                    w = pyro.sample(
+                        "w_{}".format(t),
+                        dist.Categorical(probs_w[w]), # type: ignore # "Categorical" *is* a known member of module dist
+                        infer={"enumerate": "parallel"},
+                        obs=full_sequences[batch, t, 0],
+                    )
+                    w_list.append(w)
+                    x = pyro.sample(
+                        "x_{}".format(t),
+                        dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
+                        infer={"enumerate": "parallel"},
+                        obs=full_sequences[batch, t, 1],
+                    )
+                    x_list.append(x)
+                    y = pyro.sample(
+                        "y_{}".format(t),
+                        dist.Categorical(probs_y[w, x]), # type: ignore # "Categorical" *is* a known member of module dist
+                        obs=unphase_batch(full_sequences[batch, t]),
+                    )
+                    y_list.append(y)
+
+    def phase(sparse_sequences, lengths):
+        assert len(sequences.shape) == 2
+        with ignore_jit_warnings():
+            num_sequences, max_length = map(int, sequences.shape)
+            assert lengths.shape == (num_sequences,)
+            assert lengths.max() <= max_length
+
+        # with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
+        #     batches.append(batch)
+        #     lengths = lengths[batch]
+        #     w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
+        #     for t in pyro.markov(range(max_length if args.jit else lengths.max())): # type: ignore # "Dirichlet" *is* a known member of module dist
+        #         with poutine.mask(mask=(t < lengths)):
+        #             w = pyro.sample(
+        #                 "w_{}".format(t),
+        #                 dist.Categorical(probs_w[w]), # type: ignore # "Categorical" *is* a known member of module dist
+        #                 infer={"enumerate": "parallel"},
+        #             )
+        #             w_list.append(w)
+        #             x = pyro.sample(
+        #                 "x_{}".format(t),
+        #                 dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
+        #                 infer={"enumerate": "parallel"},
+        #             )
+        #             x_list.append(x)
+        #             y = pyro.sample(
+        #                 "y_{}".format(t),
+        #                 dist.Categorical(probs_y[w, x]), # type: ignore # "Categorical" *is* a known member of module dist
+        #                 obs=sparse_sequences[batch, t],
+        #             )
+        #             y_list.append(y)
+
+    if training:
+        train_on(sequences, lengths)
+    else:
+        phase(sequences, lengths)
+
+    return w_list, x_list, y_list, batches
 
 
 
@@ -376,7 +423,7 @@ def main(args):
         train_samples = 64,
         sequence_length = 1000
     )
-    data_train = data["test"]
+    data_train = data["train"]
     sequences = torch.squeeze(data_train["sequences"])
     lengths = data_train["sequence_lengths"]
     # sequences = list(sequences)
@@ -471,8 +518,8 @@ def main(args):
     logging.info(
         "Evaluating on {} valid sequences".format(len(data["valid"]["sequences"]))
     )
-    sequences = torch.squeeze(data["test"]["sequences"])
-    lengths = torch.squeeze(data["test"]["sequence_lengths"])
+    sequences = torch.squeeze(data["train"]["sequences"])
+    lengths = torch.squeeze(data["train"]["sequence_lengths"])
     # sequences = leave_only_first_played_note(sequences, present_notes)
     if args.truncate:
         lengths = lengths.clamp(max=args.truncate)
