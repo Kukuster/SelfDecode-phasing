@@ -100,6 +100,10 @@ unphasing_dict = {
 }
 
 
+"""
+TODO: rewrite so its readable and works faster. Need to vectorize, probably using np.select()
+ see: https://stackoverflow.com/questions/67665705/numpy-equivalent-of-pandas-replace-dictionary-mapping
+"""
 def unphase_batch(batch_of_genotypes: torch.Tensor):
     assert len(batch_of_genotypes.shape) == 2, "batch_of_genotypes has to be a 2-d"
     batch_of_coded_unphased_genotypes = torch.empty(
@@ -120,6 +124,25 @@ def unphase_batch(batch_of_genotypes: torch.Tensor):
 def unphase(genotype: torch.Tensor):
     assert len(genotype) == 2 and len(genotype.shape) == 1, "genotype has to be a 1-d, and has to have total of 2 elements"
     return torch.as_tensor(unphasing_dict[tuple(genotype.tolist())], dtype=torch.long) # type: ignore
+
+
+
+def validate_full_sequences(sequences, lengths):
+    assert len(sequences.shape) == 3
+    with ignore_jit_warnings():
+        num_sequences, max_length, num_calls_per_site = map(int, sequences.shape)
+        assert num_calls_per_site == 2, "there should be 2 calls per each site"
+        assert lengths.shape == (num_sequences,)
+        assert lengths.max() <= max_length
+
+def validate_unphased_sequences(sequences, lengths):
+    assert len(sequences.shape) == 2
+    with ignore_jit_warnings():
+        num_sequences, max_length = map(int, sequences.shape)
+        assert lengths.shape == (num_sequences,)
+        assert lengths.max() <= max_length
+
+
 
 # "Factorial HMM with two hidden states."
 #
@@ -266,7 +289,7 @@ def model_3(sequences, lengths, args, batch_size=None, include_prior=True, train
 # Note that this is the "FHMM" model in reference [1].
 # kukedits:
 # made work for a reduced shape of the data: for only 1 tone out of 88
-def model_31(sequences, lengths, args, batch_size=None, include_prior=True, training:bool=True):
+def model_31(sequences, lengths, args, batch_size=None, include_prior=True, mode:Literal["train","validate","phase"]="train"):
 
     # corresponds to number of possible indices for probs_w and probs_x
     #         and to number of possible values of w and x vars
@@ -290,19 +313,16 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, trai
     y_list = []
     batches = []
 
+
     def train_on(full_sequences, lengths):
-        assert len(sequences.shape) == 3
-        with ignore_jit_warnings():
-            num_sequences, max_length, num_calls = map(int, sequences.shape)
-            assert num_calls == 2, "there should be 2 calls per each site"
-            assert lengths.shape == (num_sequences,)
-            assert lengths.max() <= max_length
+        validate_full_sequences(full_sequences, lengths)
+        num_sequences, max_length, _ = map(int, sequences.shape)
 
         with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
             batches.append(batch)
             lengths = lengths[batch]
             w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
-            for t in pyro.markov(range(max_length if args.jit else lengths.max())): # type: ignore # "Dirichlet" *is* a known member of module dist
+            for t in pyro.markov(range(max_length)): # type: ignore # "Dirichlet" *is* a known member of module dist
                 with poutine.mask(mask=(t < lengths)):
                     w = pyro.sample(
                         "w_{}".format(t),
@@ -325,42 +345,79 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, trai
                     )
                     y_list.append(y)
 
+
+    def validate(full_sequences, lengths):
+        validate_full_sequences(full_sequences, lengths)
+        num_sequences, max_length, _ = map(int, sequences.shape)
+
+        with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
+            batches.append(batch)
+            lengths = lengths[batch]
+            w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
+            for t in pyro.markov(range(max_length)): # type: ignore # "Dirichlet" *is* a known member of module dist
+                with poutine.mask(mask=(t < lengths)):
+                    w = pyro.sample(
+                        "w_{}".format(t),
+                        dist.Categorical(probs_w[w]), # type: ignore # "Categorical" *is* a known member of module dist
+                        infer={"enumerate": "parallel"},
+                        obs=full_sequences[batch, t, 0],
+                    )
+                    w_list.append(w)
+                    x = pyro.sample(
+                        "x_{}".format(t),
+                        dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
+                        infer={"enumerate": "parallel"},
+                        obs=full_sequences[batch, t, 1],
+                    )
+                    x_list.append(x)
+                    y = pyro.sample(
+                        "y_{}".format(t),
+                        dist.Categorical(probs_y[w, x]), # type: ignore # "Categorical" *is* a known member of module dist
+                        obs=unphase_batch(full_sequences[batch, t]),
+                    )
+                    y_list.append(y)
+
+
     def phase(sparse_sequences, lengths):
-        assert len(sequences.shape) == 2
-        with ignore_jit_warnings():
-            num_sequences, max_length = map(int, sequences.shape)
-            assert lengths.shape == (num_sequences,)
-            assert lengths.max() <= max_length
+        validate_unphased_sequences(sparse_sequences, lengths)
+        num_sequences, max_length = map(int, sequences.shape)
 
         # with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
         #     batches.append(batch)
         #     lengths = lengths[batch]
         #     w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
-        #     for t in pyro.markov(range(max_length if args.jit else lengths.max())): # type: ignore # "Dirichlet" *is* a known member of module dist
+        #     for t in pyro.markov(range(max_length)): # type: ignore # "Dirichlet" *is* a known member of module dist
         #         with poutine.mask(mask=(t < lengths)):
         #             w = pyro.sample(
         #                 "w_{}".format(t),
         #                 dist.Categorical(probs_w[w]), # type: ignore # "Categorical" *is* a known member of module dist
         #                 infer={"enumerate": "parallel"},
+        #                 # obs=full_sequences[batch, t, 0],
         #             )
         #             w_list.append(w)
         #             x = pyro.sample(
         #                 "x_{}".format(t),
         #                 dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
         #                 infer={"enumerate": "parallel"},
+        #                 # obs=full_sequences[batch, t, 1],
         #             )
         #             x_list.append(x)
         #             y = pyro.sample(
         #                 "y_{}".format(t),
         #                 dist.Categorical(probs_y[w, x]), # type: ignore # "Categorical" *is* a known member of module dist
-        #                 obs=sparse_sequences[batch, t],
+        #                 obs=None if sparse_sequences[batch, t]==0 else sparse_sequences[batch, t],
         #             )
         #             y_list.append(y)
 
-    if training:
+
+    if mode == "train":
         train_on(sequences, lengths)
-    else:
+    elif mode == "validate":
+        validate(sequences, lengths)
+    elif mode == "phase":
         phase(sequences, lengths)
+    else:
+        pass # ¯\_(ツ)_/¯
 
     return w_list, x_list, y_list, batches
 
@@ -500,7 +557,7 @@ def main(args):
     # We'll train on small minibatches.
     logging.info("Step\tLoss")
     for step in range(args.num_steps):
-        loss = svi.step(sequences, lengths, args=args, batch_size=args.batch_size)
+        loss = svi.step(sequences, lengths, args=args, batch_size=args.batch_size, mode="train")
         logging.info("{: >5d}\t{}".format(step, loss / num_observations)) # type: ignore
 
     if args.jit and args.time_compilation:
@@ -510,7 +567,7 @@ def main(args):
 
     # We evaluate on the entire training dataset,
     # excluding the prior term so our results are comparable across models.
-    train_loss = elbo.loss(model, guide, sequences, lengths, args, include_prior=False)
+    train_loss = elbo.loss(model, guide, sequences, lengths, args, include_prior=False, mode="validate")
     logging.info("training loss = {}".format(train_loss / num_observations))
 
     # Finally we evaluate on the valid dataset.
@@ -518,8 +575,8 @@ def main(args):
     logging.info(
         "Evaluating on {} valid sequences".format(len(data["valid"]["sequences"]))
     )
-    sequences = torch.squeeze(data["train"]["sequences"])
-    lengths = torch.squeeze(data["train"]["sequence_lengths"])
+    sequences = torch.squeeze(data["valid"]["sequences"])
+    lengths = torch.squeeze(data["valid"]["sequence_lengths"])
     # sequences = leave_only_first_played_note(sequences, present_notes)
     if args.truncate:
         lengths = lengths.clamp(max=args.truncate)
@@ -529,7 +586,7 @@ def main(args):
     # numerical stability) this valid loss may not be directly comparable to numbers
     # reported on this dataset elsewhere.
     valid_loss = elbo.loss(
-        model, guide, sequences, lengths, args=args, include_prior=False
+        model, guide, sequences, lengths, args=args, include_prior=False, mode="validate"
     )
     logging.info("valid loss = {}".format(valid_loss / num_observations))
 
@@ -544,13 +601,15 @@ def main(args):
     # sequences = data["test"]["sequences"]
     # lengths = data["test"]["sequence_lengths"]
     # xs = pyro.infer.discrete.infer_discrete(model, temperature=0, first_available_dim=-3) # type: ignore
-    # print("xs", xs)
-    # # print("xs.shape", xs.shape)
+    # # print("xs", xs)
+    # print("xs.shape", xs.shape)
     # # xs = pyro.infer.discrete.infer_discrete(model_8, temperature=0, first_available_dim=-3)
     # trace = poutine.trace(xs).get_trace(sequences,lengths, args=args, batch_size=args.batch_size, training=False) # type: ignore
-    # print(type(trace))
+    # # print(type(trace))
     # print(trace.nodes)
-    # # print(trace.nodes.shape)
+    # print(trace.nodes.shape)
+
+    # return None
 
 
 

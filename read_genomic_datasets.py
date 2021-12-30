@@ -94,11 +94,11 @@ def read_genomic_datasets(
         },
         "train": {
             "sequence_lengths": torch.tensor([train_translated.shape[1] for i in train_translated]).to(torch.long),
-            "sequences": torch.tensor(train_translated).to(torch.float32),
+            "sequences": torch.tensor(train_translated).to(torch.long),
         },
         "valid": {
             "sequence_lengths": torch.tensor([valid_translated.shape[1] for i in valid_translated]).to(torch.long),
-            "sequences": torch.tensor(valid_translated).to(torch.float32),
+            "sequences": torch.tensor(valid_translated).to(torch.long),
         },
     }
 
