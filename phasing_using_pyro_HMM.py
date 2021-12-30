@@ -75,6 +75,22 @@ eye = torch.eye
 sample = pyro.sample
 T = torch.Tensor
 
+def Eight():
+    return T([0,0,0,0,0,0,0,0]).to(torch.long)
+
+def prop_np_array(maybe_arr: Union[torch.Tensor, np.ndarray]):
+    if isinstance(maybe_arr, torch.Tensor):
+        arr = maybe_arr.cpu().detach().numpy()
+    elif isinstance(maybe_arr, np.ndarray):
+        arr = maybe_arr
+    else:
+        raise ValueError("function should receive either np array or torch tensor")
+    unique, counts = np.unique(arr, return_counts=True)
+    proportions = counts/len(arr)
+    return dict(zip(unique, proportions))
+
+
+
 
 unphasing_dict = {
     (0,0): 1,
@@ -255,7 +271,10 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, trai
         num_sequences, max_length = map(int, sequences.shape)
         assert lengths.shape == (num_sequences,)
         assert lengths.max() <= max_length
-    hidden_dim = int(args.hidden_dim ** 0.5)  # split between w and x
+    # corresponds to number of possible indices for probs_w and probs_x
+    #         and to number of possible values of w and x vars
+    hidden_dim = 2   # for both w and x can be 0 and 1
+    observed_dim = 4 # can be 0 (unknown), 1 (0/0), 2 (0/1), 3 (1/1)
     with poutine.mask(mask=include_prior):
         probs_w = pyro.sample(
             "probs_w", dist.Dirichlet(0.9 * torch.eye(hidden_dim) + 0.1).to_event(1) # type: ignore # "Dirichlet" *is* a known member of module dist
@@ -265,7 +284,7 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, trai
         )
         probs_y = pyro.sample(
             "probs_y",
-            dist.Beta(0.1, 0.9).expand([hidden_dim, hidden_dim]).to_event(2), # type: ignore # "Beta" *is* a known member of module dist
+            dist.Beta(0.1, 0.9).expand([hidden_dim, hidden_dim, observed_dim]).to_event(3), # type: ignore # "Beta" *is* a known member of module dist
         )
 
     w_list = []
@@ -274,7 +293,7 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, trai
     # tones_plate = pyro.plate("tones", data_dim, dim=-1)
     with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
         lengths = lengths[batch]
-        w, x = 0, 0
+        w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
         for t in pyro.markov(range(max_length if args.jit else lengths.max())): # type: ignore # "Dirichlet" *is* a known member of module dist
             with poutine.mask(mask=(t < lengths)):
                 w = pyro.sample(
@@ -291,10 +310,12 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, trai
                 x_list.append(x)
                 y = pyro.sample(
                     "y_{}".format(t),
-                    dist.Bernoulli(probs_y[w, x]), # type: ignore # "Bernoulli" *is* a known member of module dist
+                    dist.Categorical(probs_y[w, x]), # type: ignore # "Bernoulli" *is* a known member of module dist
                     obs=sequences[batch, t],
                 )
                 y_list.append(y)
+
+    return w_list, x_list, y_list
 
 
 
@@ -350,28 +371,26 @@ def main(args):
 
     logging.info("Loading data")
 
-    # data = read_genomic_datasets(
-    #     test_samples = 5,
-    #     train_samples = 40,
-    #     sequence_length = 1000
-    # )
-    # data_train = data["train"]
-    # sequences = data_train["sequences"]
-    # lengths = data_train["sequence_lengths"]
-    # # sequences = list(sequences)
-    # # sequences = torch.Tensor(sequences + sequences)
-    # # lengths = list(lengths)
-    # # lengths = torch.Tensor(lengths + lengths)
+    data = read_genomic_datasets(
+        test_samples = 16,
+        train_samples = 64,
+        sequence_length = 1000
+    )
+    data_train = data["test"]
+    sequences = torch.squeeze(data_train["sequences"])
+    lengths = data_train["sequence_lengths"]
+    # sequences = list(sequences)
+    # sequences = torch.Tensor(sequences + sequences)
+    # lengths = list(lengths)
+    # lengths = torch.Tensor(lengths + lengths)
 
-    data = poly.load_data(poly.JSB_CHORALES)
-    sequences = data["train"]["sequences"]
-    lengths = data["train"]["sequence_lengths"]
-    sequences = sequences[0:13]
-    lengths = lengths[0:13]
-
-    present_notes = (sequences == 1).sum(0).sum(0) > 0
-    # remove notes that are never played (we remove 37/88 notes)
-    sequences = leave_only_first_played_note(sequences, present_notes)
+    # data = poly.load_data(poly.JSB_CHORALES)
+    # sequences = data["train"]["sequences"]
+    # lengths = data["train"]["sequence_lengths"]
+    # sequences = sequences[0:13]
+    # lengths = lengths[0:13]
+    # present_notes = (sequences == 1).sum(0).sum(0) > 0
+    # sequences = leave_only_first_played_note(sequences, present_notes)
 
 
     logging.info("-" * 40)
@@ -452,9 +471,9 @@ def main(args):
     logging.info(
         "Evaluating on {} valid sequences".format(len(data["valid"]["sequences"]))
     )
-    sequences = data["valid"]["sequences"]
-    lengths = data["valid"]["sequence_lengths"]
-    sequences = leave_only_first_played_note(sequences, present_notes)
+    sequences = torch.squeeze(data["test"]["sequences"])
+    lengths = torch.squeeze(data["test"]["sequence_lengths"])
+    # sequences = leave_only_first_played_note(sequences, present_notes)
     if args.truncate:
         lengths = lengths.clamp(max=args.truncate)
     num_observations = float(lengths.sum())
