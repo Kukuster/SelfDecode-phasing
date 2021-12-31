@@ -90,7 +90,7 @@ def read_genomic_datasets(
     data = {
         "test": {
             "sequence_lengths": torch.tensor([test.shape[1] for i in test]).to(torch.long),
-            "sequences": torch.tensor(test).to(torch.float32),
+            "sequences": torch.tensor(test).to(torch.long),
         },
         "train": {
             "sequence_lengths": torch.tensor([train_translated.shape[1] for i in train_translated]).to(torch.long),

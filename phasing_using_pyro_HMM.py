@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterable, List, Literal, Tuple, TypeVar, Union
 from functools import partial
 from collections import Counter
 import sys
+import time
 
 
 # from jax import random
@@ -61,10 +62,10 @@ log.addHandler(debug_handler)
 def rand_str(length:int=10):
     return ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(length))
 
-_sample_dist       = lambda adist: pyro.sample(rand_str(), adist)
-_shape_dist        = lambda adist: pyro.sample(rand_str(), adist).shape
-_sample_dist_infer = lambda adist: pyro.sample(rand_str(), adist, infer={"enumerate": "parallel"})
-_shape_dist_infer  = lambda adist: pyro.sample(rand_str(), adist, infer={"enumerate": "parallel"}).shape
+# _sample_dist       = lambda adist: pyro.sample(rand_str(), adist)
+# _shape_dist        = lambda adist: pyro.sample(rand_str(), adist).shape
+# _sample_dist_infer = lambda adist: pyro.sample(rand_str(), adist, infer={"enumerate": "parallel"})
+# _shape_dist_infer  = lambda adist: pyro.sample(rand_str(), adist, infer={"enumerate": "parallel"}).shape
 
 Cate = dist.Categorical # type: ignore # "Categorical" *is* a known member of module dist
 Bern = dist.Bernoulli # type: ignore # "Bernoulli" *is* a known member of module dist
@@ -72,7 +73,7 @@ Diri = dist.Dirichlet # type: ignore # "Dirichlet" *is* a known member of module
 Beta = dist.Beta # type: ignore # "Beta" *is* a known member of module dist
 
 eye = torch.eye
-sample = pyro.sample
+# sample = pyro.sample
 T = torch.Tensor
 
 def Eight():
@@ -294,24 +295,102 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, mode
     # corresponds to number of possible indices for probs_w and probs_x
     #         and to number of possible values of w and x vars
     hidden_dim = 2   # for both w and x can be 0 and 1
-
     observed_dim = 4 # can be 0 (unknown), 1 (0/0), 2 (0/1), 3 (1/1)
+
     with poutine.mask(mask=include_prior):
+
+        """
+        Parameters for prior probabilities of finding ref (0) or alt (1) after ref (0) or alt (1).
+        Parameters were roughly set in accord to two assumptions:
+         - approximate occurence of 1s in sequences is around 7%
+         - 1s tend to hang out together.
+
+        In fact, these two variables can be measured before training the model.
+        """
+        p_0_followedby_0 = 0.80
+        p_0_followedby_1 = 0.20
+        p_1_followedby_0 = 0.65
+        p_1_followedby_1 = 0.35
+
+        w_to_w_probs = torch.Tensor([
+            [p_0_followedby_0, p_0_followedby_1],
+            [p_1_followedby_0, p_1_followedby_1],
+        ])
+        x_to_x_probs = torch.Tensor([
+            [p_0_followedby_0, p_0_followedby_1],
+            [p_1_followedby_0, p_1_followedby_1],
+        ])
+        assert w_to_w_probs.shape[-1] == hidden_dim
+        assert x_to_x_probs.shape[-1] == hidden_dim
+
         probs_w = pyro.sample(
-            "probs_w", dist.Dirichlet(0.9 * torch.eye(hidden_dim) + 0.1).to_event(1) # type: ignore # "Dirichlet" *is* a known member of module dist
+            "probs_w", dist.Dirichlet(w_to_w_probs).to_event(1) # type: ignore # "Dirichlet" *is* a known member of module dist
         )
         probs_x = pyro.sample(
-            "probs_x", dist.Dirichlet(0.9 * torch.eye(hidden_dim) + 0.1).to_event(1) # type: ignore # "Dirichlet" *is* a known member of module dist
-        )
-        probs_y = pyro.sample(
-            "probs_y",
-            dist.Beta(0.1, 0.9).expand([hidden_dim, hidden_dim, observed_dim]).to_event(3), # type: ignore # "Beta" *is* a known member of module dist
+            "probs_x", dist.Dirichlet(x_to_x_probs).to_event(1) # type: ignore # "Dirichlet" *is* a known member of module dist
         )
 
-    w_list = []
-    x_list = []
-    y_list = []
-    batches = []
+        """
+        Parameter for prior probability that one of two calls was incorrect
+        Literally, probability we will observe an unphased genotype that will differ by one call
+        from the real underlying genotype. i.e.:
+            p_1  = 
+                P( '0/1' | '1|1' )  = 
+                P( '0/1' | '0|0' )  = 
+                P( '0/0' | '1|0' )  = 
+                P( '0/0' | '0|1' )  = 
+                P( '1/1' | '1|0' )  = 
+                P( '1/1' | '0|1' )
+        """
+        p_1 = 2e-4
+
+        """
+        Parameter for prior probability that both two calls were incorrect
+        Literally, probability we will observe an unphased genotype that will differ by both calls
+        from the real underlying genotype. i.e.:
+            p_2  = 
+                P( '0/0' | '1|1' )  = 
+                P( '1/1' | '0|0' )
+        """
+        p_2 = 2e-5
+
+        """
+        Parameter for prior probability that both two calls were correct!
+        Literally, probability we will observe an unphased genotype that has the same number of alt calls
+        as the real underlying genotype. i.e.:
+            p_0  = 
+                P( '0/0' | '0|0' )  = 
+                P( '0/1' | '0|1' )  = 
+                P( '1/0' | '1|0' )  = 
+                P( '1/1' | '1|1' )
+        """
+        p_0 = 1 - (2*p_1) - p_2
+
+        """
+        Parameter for prior probability that it's a "." (missing call) given a full genotype
+        Literally, probability we will observe an unphased genotype that has the same number of alt calls
+        as the real underlying genotype. i.e.:
+            p_m  = 
+                P( '.' | '0|0' )  = 
+                P( '.' | '0|1' )  = 
+                P( '.' | '1|0' )  = 
+                P( '.' | '1|1' )
+        """
+        p_m = 2e-12
+
+
+        wx_to_y_probs = torch.Tensor([
+            [ [p_m, p_0, p_1, p_2,],
+              [p_m, p_1, p_0, p_1,] ],
+            [ [p_m, p_1, p_0, p_1,],
+              [p_m, p_2, p_1, p_0,] ],
+        ])
+        assert wx_to_y_probs.shape[-1] == observed_dim
+
+        probs_y = pyro.sample(
+            "probs_y",
+            dist.Dirichlet(wx_to_y_probs).to_event(2), # type: ignore # "Beta" *is* a known member of module dist
+        )
 
 
     def train_on(full_sequences, lengths):
@@ -319,7 +398,6 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, mode
         num_sequences, max_length, _ = map(int, sequences.shape)
 
         with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
-            batches.append(batch)
             lengths = lengths[batch]
             w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
             for t in pyro.markov(range(max_length)): # type: ignore # "Dirichlet" *is* a known member of module dist
@@ -330,20 +408,17 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, mode
                         infer={"enumerate": "parallel"},
                         obs=full_sequences[batch, t, 0],
                     )
-                    w_list.append(w)
                     x = pyro.sample(
                         "x_{}".format(t),
                         dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
                         infer={"enumerate": "parallel"},
                         obs=full_sequences[batch, t, 1],
                     )
-                    x_list.append(x)
                     y = pyro.sample(
                         "y_{}".format(t),
                         dist.Categorical(probs_y[w, x]), # type: ignore # "Categorical" *is* a known member of module dist
                         obs=unphase_batch(full_sequences[batch, t]),
                     )
-                    y_list.append(y)
 
 
     def validate(full_sequences, lengths):
@@ -351,7 +426,6 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, mode
         num_sequences, max_length, _ = map(int, sequences.shape)
 
         with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
-            batches.append(batch)
             lengths = lengths[batch]
             w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
             for t in pyro.markov(range(max_length)): # type: ignore # "Dirichlet" *is* a known member of module dist
@@ -362,66 +436,93 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True, mode
                         infer={"enumerate": "parallel"},
                         obs=full_sequences[batch, t, 0],
                     )
-                    w_list.append(w)
                     x = pyro.sample(
                         "x_{}".format(t),
                         dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
                         infer={"enumerate": "parallel"},
                         obs=full_sequences[batch, t, 1],
                     )
-                    x_list.append(x)
                     y = pyro.sample(
                         "y_{}".format(t),
                         dist.Categorical(probs_y[w, x]), # type: ignore # "Categorical" *is* a known member of module dist
                         obs=unphase_batch(full_sequences[batch, t]),
                     )
-                    y_list.append(y)
 
 
     def phase(sparse_sequences, lengths):
         validate_unphased_sequences(sparse_sequences, lengths)
         num_sequences, max_length = map(int, sequences.shape)
 
-        # with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
-        #     batches.append(batch)
-        #     lengths = lengths[batch]
-        #     w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
-        #     for t in pyro.markov(range(max_length)): # type: ignore # "Dirichlet" *is* a known member of module dist
-        #         with poutine.mask(mask=(t < lengths)):
-        #             w = pyro.sample(
-        #                 "w_{}".format(t),
-        #                 dist.Categorical(probs_w[w]), # type: ignore # "Categorical" *is* a known member of module dist
-        #                 infer={"enumerate": "parallel"},
-        #                 # obs=full_sequences[batch, t, 0],
-        #             )
-        #             w_list.append(w)
-        #             x = pyro.sample(
-        #                 "x_{}".format(t),
-        #                 dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
-        #                 infer={"enumerate": "parallel"},
-        #                 # obs=full_sequences[batch, t, 1],
-        #             )
-        #             x_list.append(x)
-        #             y = pyro.sample(
-        #                 "y_{}".format(t),
-        #                 dist.Categorical(probs_y[w, x]), # type: ignore # "Categorical" *is* a known member of module dist
-        #                 obs=None if sparse_sequences[batch, t]==0 else sparse_sequences[batch, t],
-        #             )
-        #             y_list.append(y)
+        with pyro.plate("sequences", num_sequences, batch_size, dim=-1) as batch:
+            # if batch is not None:
+            #     w_seq = np.zeros(shape=(max_length, len(batch)))
+            #     x_seq = np.zeros(shape=(max_length, len(batch)))
+            #     y_seq = np.zeros(shape=(max_length, len(batch)))
+            # else:
+            #     w_seq = np.zeros(max_length)
+            #     x_seq = np.zeros(max_length)
+            #     y_seq = np.zeros(max_length)
+            w_seq = []
+            x_seq = []
+            y_seq = []
+            batches = []
+
+            batches.append(batch)
+            lengths = lengths[batch]
+            w, x = torch.as_tensor(0).to(torch.long), torch.as_tensor(0).to(torch.long)
+            for t in pyro.markov(range(max_length)): # type: ignore # "Dirichlet" *is* a known member of module dist
+                with poutine.mask(mask=(t < lengths)):
+                    w = pyro.sample(
+                        "w_{}".format(t),
+                        dist.Categorical(probs_w[w]), # type: ignore # "Categorical" *is* a known member of module dist
+                        infer={"enumerate": "parallel"},
+                    )
+                    w_seq.append(w)
+                    x = pyro.sample(
+                        "x_{}".format(t),
+                        dist.Categorical(probs_x[x]), # type: ignore # "Categorical" *is* a known member of module dist
+                        infer={"enumerate": "parallel"},
+                    )
+                    x_seq.append(x)
+
+                    obs_mask = sparse_sequences[batch, t].to(torch.bool)
+                    # non-zero (1,2,3) mean present genotype data, so set to 1 to include in obs
+                    obs_mask[obs_mask != 0.] = 1
+                    # 0 means missing genotype data, so set to 0 to exclude in obs
+                    obs_mask[obs_mask == 0.] = 0
+                    y = pyro.sample(
+                        "y_{}".format(t),
+                        dist.Categorical(probs_y[w, x]), # type: ignore # "Categorical" *is* a known member of module dist
+                        obs=sparse_sequences[batch, t],
+                        obs_mask=obs_mask
+                    ).to(torch.float32)
+                    y_seq.append(y)
+
+        return w_seq, x_seq, y_seq, batches
 
 
     if mode == "train":
-        train_on(sequences, lengths)
+        return train_on(sequences, lengths)
     elif mode == "validate":
-        validate(sequences, lengths)
+        print("probs_w")
+        print(probs_w)
+        print("probs_x")
+        print(probs_x)
+        print("probs_y")
+        print(probs_y)
+        return validate(sequences, lengths)
     elif mode == "phase":
-        phase(sequences, lengths)
+        # probs_x = torch.Tensor([[0.9451, 0.0549],
+        #                         [0.8826, 0.1174]])
+        print("probs_w")
+        print(probs_w)
+        print("probs_x")
+        print(probs_x)
+        print("probs_y")
+        print(probs_y)
+        return phase(sequences, lengths)
     else:
-        pass # ¯\_(ツ)_/¯
-
-    return w_list, x_list, y_list, batches
-
-
+        return None # ¯\_(ツ)_/¯
 
 
 
@@ -429,6 +530,68 @@ def leave_only_first_played_note(sequences, present_notes):
     sequences = sequences[..., present_notes]
     sequences = sequences[..., 0] # leave only one played note
     return sequences
+
+
+
+
+
+def test_phasing_accuracy_of_batch_by_concordance(unphased_sequences, full_sequences, w_list, x_list, batch):
+    batch_accuracy = np.zeros(len(batch)).astype(np.float32)
+    batch_counttophase = np.zeros(len(batch)).astype(np.int64)
+    
+    for i, seq_i in enumerate(batch):
+        count_total_tophase = 0
+        count_phased_correctly = 0
+        
+        for site in range(len(full_sequences[0])):
+            if np.around(unphased_sequences[seq_i][site].numpy()) == 2: # 2 corresponds to 0/1, the only genotype that needs phasing
+                count_total_tophase += 1
+                if tuple(full_sequences[seq_i][site].tolist()) == (w_list[i][site], x_list[i][site]):
+                    count_phased_correctly += 1
+
+        batch_accuracy[i] = count_phased_correctly/count_total_tophase if count_total_tophase else np.nan
+        batch_counttophase[i] = count_total_tophase
+
+    return batch_accuracy, batch_counttophase
+
+
+
+def test_imputation_accuracy_of_batch_by_concordance_of_non_ref(unphased_sequences, full_sequences, w_list, x_list, batch):
+    batch_accuracy = np.zeros(len(batch)).astype(np.float32)
+    batch_counttoimp = np.zeros(len(batch)).astype(np.int64)
+    
+    for i, seq_i in enumerate(batch):
+        count_total_toimp = 0
+        count_imped_correctly = 0
+        
+        for site in range(len(full_sequences[0])):
+            genotype_tuple = tuple(full_sequences[seq_i][site].tolist())
+            # test only sites where we need to impute and the true genotype has at least 1 alt
+            if unphased_sequences[seq_i][site] == 0 and sum(genotype_tuple) > 0:
+                count_total_toimp += 1
+                if genotype_tuple == (w_list[i][site], x_list[i][site]):
+                    count_imped_correctly += 1
+
+        batch_accuracy[i] = count_imped_correctly/count_total_toimp if count_total_toimp else np.nan
+        batch_counttoimp[i] = count_total_toimp
+
+    return batch_accuracy, batch_counttoimp
+
+
+
+def test_accuracy(test_fn, unphased_sequences, full_sequences, w_list, x_list, batches):
+    accuracy = np.zeros(len(full_sequences)).astype(np.float32)
+    count_sitestotest = np.zeros(len(full_sequences)).astype(np.int64)
+
+    for batch in batches:
+        batch_accuracy, batch_sitestotest = test_fn(unphased_sequences, full_sequences, w_list, x_list, batch)
+        for i, seq_i in enumerate(batch):
+            accuracy[seq_i]     = batch_accuracy[i]
+            count_sitestotest[seq_i] = batch_sitestotest[i]
+    
+    return accuracy, count_sitestotest
+
+
 
 
 
@@ -476,12 +639,12 @@ def main(args):
     logging.info("Loading data")
 
     data = read_genomic_datasets(
-        test_samples = 16,
-        train_samples = 64,
-        sequence_length = 1000
+        test_samples = 8,
+        train_samples = 256,
+        sequence_length = 2000
     )
     data_train = data["train"]
-    sequences = torch.squeeze(data_train["sequences"])
+    sequences = data_train["sequences"]
     lengths = data_train["sequence_lengths"]
     # sequences = list(sequences)
     # sequences = torch.Tensor(sequences + sequences)
@@ -496,13 +659,18 @@ def main(args):
     # present_notes = (sequences == 1).sum(0).sum(0) > 0
     # sequences = leave_only_first_played_note(sequences, present_notes)
 
-
     logging.info("-" * 40)
 
     logging.info("Training {} on {} sequences".format(model.__name__, len(sequences)))
 
-    logging.info(f'sequences.shape: {sequences.shape}')
-    logging.info(sequences.shape)
+    logging.info(f"sequences.shape: {sequences.shape}")
+    unphased_sequences_arr = data['test']['sequences'].detach().numpy()
+    unphased_sequences_arr_occurances_of_2 = unphased_sequences_arr[unphased_sequences_arr==2].shape[0]
+    logging.info(
+        f"Total sites to phase: {unphased_sequences_arr_occurances_of_2}"
+    )
+    logging.info(f"Learning rate: {args.learning_rate}")
+    logging.info(f"Seed: {args.seed}")
     # logging.info(sequences)
     # logging.info('lengths: {}'.format(lengths))
 
@@ -555,10 +723,18 @@ def main(args):
         svi = SVI(model, guide, optim, elbo)
 
     # We'll train on small minibatches.
-    logging.info("Step\tLoss")
+    logging.info("Step\tLoss\t Time \t  Total time")
+    t0 = time.time()
     for step in range(args.num_steps):
+        tn = time.time()
         loss = svi.step(sequences, lengths, args=args, batch_size=args.batch_size, mode="train")
-        logging.info("{: >5d}\t{}".format(step, loss / num_observations)) # type: ignore
+        tnp1 = time.time()
+        logging.info("{: >5d}\t{}\t {} s \t {} s".format(
+            step,
+            round(loss/num_observations,5), # type: ignore
+            round(tnp1-tn,3),
+            round(tnp1-t0,3)
+        ))
 
     if args.jit and args.time_compilation:
         logging.debug(
@@ -575,8 +751,8 @@ def main(args):
     logging.info(
         "Evaluating on {} valid sequences".format(len(data["valid"]["sequences"]))
     )
-    sequences = torch.squeeze(data["valid"]["sequences"])
-    lengths = torch.squeeze(data["valid"]["sequence_lengths"])
+    valid_sequences = sequences = torch.squeeze(data["valid"]["sequences"])
+    valid_lengths = lengths = torch.squeeze(data["valid"]["sequence_lengths"])
     # sequences = leave_only_first_played_note(sequences, present_notes)
     if args.truncate:
         lengths = lengths.clamp(max=args.truncate)
@@ -598,18 +774,105 @@ def main(args):
     logging.info("{} capacity = {} parameters".format(model.__name__, capacity))
 
 
-    # sequences = data["test"]["sequences"]
-    # lengths = data["test"]["sequence_lengths"]
-    # xs = pyro.infer.discrete.infer_discrete(model, temperature=0, first_available_dim=-3) # type: ignore
-    # # print("xs", xs)
-    # print("xs.shape", xs.shape)
-    # # xs = pyro.infer.discrete.infer_discrete(model_8, temperature=0, first_available_dim=-3)
-    # trace = poutine.trace(xs).get_trace(sequences,lengths, args=args, batch_size=args.batch_size, training=False) # type: ignore
-    # # print(type(trace))
-    # print(trace.nodes)
-    # print(trace.nodes.shape)
+    # Phasing
+    logging.info("-" * 40)
+    logging.info(
+        "Phasing {} test sequences".format(len(data["test"]["sequences"]))
+    )
 
-    # return None
+    sequences = torch.squeeze(data["test"]["sequences"])
+    lengths = torch.squeeze(data["test"]["sequence_lengths"])
+    w_list, x_list, y_list, batches = pyro.infer.discrete.infer_discrete(  # type: ignore # "infer" *is* a known member of pyro
+        model, temperature=0, first_available_dim=-3
+    )(
+        sequences,lengths, args=args, mode="phase"
+    )
+
+    w_list, x_list, y_list = map(torch.stack           , (w_list, x_list, y_list))
+    w_list, x_list, y_list = map(lambda tens: tens.T   , (w_list, x_list, y_list))
+
+    # trace = poutine.trace(xs).get_trace(sequences,lengths, args=args, batch_size=args.batch_size, mode="phase") # type: ignore
+
+    logging.info("-" * 40)
+
+    logging.info(
+        "Sanity check, comparing statistics from valid sequences and generated sequences:"
+    )
+
+    logging.info("proportion of alts in w_list and x_list: {},\t{}".format(
+        np.mean(w_list.detach().numpy()),
+        np.mean(x_list.detach().numpy())
+    ))
+    logging.info("proportion of alts in full_sequences:    {},\t{}".format(
+        np.mean(valid_sequences[:,:,0].detach().numpy()),
+        np.mean(valid_sequences[:,:,1].detach().numpy())
+    ))
+    
+
+    logging.info("-" * 40)
+
+    logging.info(
+        "Measuring phasing accuracy by concordance"
+    )
+
+    accuracy, counttophase = test_accuracy(
+        test_phasing_accuracy_of_batch_by_concordance,
+        unphased_sequences=torch.squeeze(data["test"]["sequences"]),
+        full_sequences=torch.squeeze(data["valid"]["sequences"]),
+        w_list=w_list,
+        x_list=x_list,
+        batches=batches,
+    )
+
+    logging.info(f"number of sites to phase for all sequences: {counttophase}")
+    logging.info(f"accuracy for all sequences: {accuracy}")
+
+    total_tophase = counttophase.sum()
+    average_accuracy = sum([
+        accuracy[i]*(counttophase[i]/total_tophase) for i in range(len(accuracy)) if not np.isnan(accuracy[i])
+    ])
+    logging.info(f"total accuracy: {average_accuracy}")
+
+    logging.info("-" * 40)
+
+
+    logging.info(
+        "Measuring imputation accuracy by concordance (only for sites with at least 1 alt allele)"
+    )
+
+    unphased_sequences_arr = data['valid']['sequences'].detach().numpy()
+    unphased_sequences_arr_summed_genotypes = np.sum(unphased_sequences_arr, axis=-1)
+    unphased_sequences_arr_num_of_nonref_genotypes = unphased_sequences_arr_summed_genotypes[unphased_sequences_arr_summed_genotypes>0].shape[0]
+
+    logging.info(
+        "total non-ref sites: {} ({}%)".format(
+            unphased_sequences_arr_num_of_nonref_genotypes,
+            np.around(
+                100 * unphased_sequences_arr_num_of_nonref_genotypes/
+                    (unphased_sequences_arr.shape[0]*unphased_sequences_arr.shape[1])
+            , decimals=4)
+        ))
+
+    accuracy, counttoimp = test_accuracy(
+        test_imputation_accuracy_of_batch_by_concordance_of_non_ref,
+        unphased_sequences=torch.squeeze(data["test"]["sequences"]),
+        full_sequences=torch.squeeze(data["valid"]["sequences"]),
+        w_list=w_list,
+        x_list=x_list,
+        batches=batches,
+    )
+
+    logging.info(f"number of non-ref sites to impute for all sequences: {counttoimp}")
+    logging.info(f"accuracy for all sequences: {accuracy}")
+
+    total_toimp = counttoimp.sum()
+    average_accuracy = sum([
+        accuracy[i]*(counttoimp[i]/total_toimp) for i in range(len(accuracy)) if not np.isnan(accuracy[i])
+    ])
+    logging.info(f"total accuracy: {average_accuracy}")
+
+
+    return None
 
 
 
@@ -626,7 +889,7 @@ if __name__ == "__main__":
         type=str,
         help="one of: {}".format(", ".join(sorted(models.keys()))),
     )
-    parser.add_argument("-n", "--num-steps", default=10, type=int)
+    parser.add_argument("-n", "--num-steps", default=40, type=int)
     parser.add_argument("-b", "--batch-size", default=8, type=int)
     parser.add_argument("-d", "--hidden-dim", default=2, type=int)
     parser.add_argument("-nn", "--nn-dim", default=48, type=int)
