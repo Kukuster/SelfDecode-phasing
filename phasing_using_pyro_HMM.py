@@ -5,7 +5,7 @@ import random
 import string
 import time
 from random import randint
-from typing import Any, Callable, Iterable, List, Literal, Tuple, TypeVar, Union
+from typing import Any, Callable, Iterable, List, Literal, Tuple, TypeVar, Union, Callable
 from functools import partial
 from collections import Counter
 import sys
@@ -36,6 +36,7 @@ from pyro.infer import HMC, MCMC, NUTS
 # from pyro.infer.autoguide import AutoDelta
 import pyro.distributions as dist
 from pyro.infer.autoguide.guides import AutoDelta
+from pyro.infer import Predictive
 from pyro.ops.indexing import Vindex
 from pyro.optim import Adam # type: ignore # "Adam" *is* a known import symbol
 from pyro.util import ignore_jit_warnings
@@ -441,18 +442,70 @@ def sample_MM(
     model,
     sequences,
     lengths,
-    method: Literal['infer_discrete', 'MCMC_NUTS', 'MCMC_HMC', 'poutine_trace'] = 'infer_discrete',
+    args,
+    method: Literal['infer_discrete', 'MCMC_NUTS', 'MCMC_HMC',
+                    'poutine_trace', 'predictive'] = 'infer_discrete',
+    seed = 0,
+    guide: Union[Callable, None] = None,
 ):
     if method == 'infer_discrete':
         w_list, x_list, y_list, batches = pyro.infer.discrete.infer_discrete(  # type: ignore # "infer" *is* a known member of pyro
             model, temperature=0, first_available_dim=-3
         )(
-            sequences,lengths, args=args, mode="phase"
+            sequences, lengths, args=args, mode="phase"
         )
 
         w_list, x_list, y_list = map(torch.stack           , (w_list, x_list, y_list))
         w_list, x_list, y_list = map(lambda tens: tens.T   , (w_list, x_list, y_list))
+        print(f"w_list shape: {w_list.shape}")
+        # print(f"type(batches): {type(batches)}")
+        # print(f"batches shape: {np.array(batches).shape}")
         return w_list, x_list, y_list, batches
+
+    elif method.startswith('MCMC'):
+        raise NotImplementedError()
+        kernel = {"MCMC_NUTS": NUTS, "MCMC_HMC": HMC}[method](model)
+        # mcmc = MCMC(kernel, num_samples=500)
+        # mcmc.run(data)
+        # samples = mcmc.get_samples()
+
+        mcmc = MCMC(
+            kernel,
+            num_samples=1,
+        )
+        mcmc.run(seed, sequences, lengths, args, mode="phase")
+
+        posterior_samples = mcmc.get_samples()
+        # predictive = Predictive(model, posterior_samples=posterior_samples)
+        # samples = predictive(rng_key, sequences, lengths, args, training=False)
+        return None, None, None, None
+
+    elif method == 'predictive':
+        if guide is None: raise ValueError('"predictive" method for sampling a trained HMM requires specifying guide')
+        predictive_sample = Predictive(model, guide=guide, num_samples=1)(sequences, lengths, args=args, mode="phase")
+        the_length = lengths[0]
+        w_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
+        x_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
+        y_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
+
+        for i in range(the_length):
+            w_list[i] = predictive_sample[f'w_{i}']
+            x_list[i] = predictive_sample[f'x_{i}']
+            y_list[i] = predictive_sample[f'y_{i}']
+        
+        batches = [ torch.Tensor([i for i in range(len(sequences))]).to(torch.int32) ]
+        w_list, x_list, y_list = w_list.T, x_list.T, y_list.T
+
+        print(f"w_list shape: {w_list.shape}")
+        # print(f"type(batches): {type(batches)}")
+        # print(f"batches shape: {np.array(batches).shape}")
+        return w_list, x_list, y_list, batches
+
+    elif method == 'poutine_trace':
+        raise NotImplementedError()
+        trace = poutine.trace(model).get_trace(sequences,lengths, args=args, batch_size=args.batch_size, mode="phase")
+        return None, None, None, None
+    
     else:
         raise ValueError('supply a valid method')
         return None, None, None, None # ¯\_(ツ)_/¯
@@ -502,17 +555,17 @@ def main(args):
 
     logging.info("Loading data")
 
-    # for this setup more than 40 steps doesn't help
+    # for this setup, with learning rate 0.05, more than 40 steps doesn't help
+    # data = read_genomic_datasets(
+    #     test_samples = 8,
+    #     train_samples = 256,
+    #     sequence_length = 2000
+    # )
     data = read_genomic_datasets(
         test_samples = 8,
         train_samples = 256,
-        sequence_length = 2000
+        sequence_length = 1000
     )
-    # data = read_genomic_datasets(
-    #     test_samples = 2,
-    #     train_samples = 32,
-    #     sequence_length = 1000
-    # )
     data_train = data["train"]
     sequences = data_train["sequences"]
     lengths = data_train["sequence_lengths"]
@@ -647,7 +700,13 @@ def main(args):
 
     sequences = torch.squeeze(data["test"]["sequences"])
     lengths = torch.squeeze(data["test"]["sequence_lengths"])
-    w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, 'infer_discrete')
+    # w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='infer_discrete')
+    w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='predictive', guide=guide)
+    assert w_list is not None
+    assert x_list is not None
+    assert y_list is not None
+    assert batches is not None
+
 
     # trace = poutine.trace(xs).get_trace(sequences,lengths, args=args, batch_size=args.batch_size, mode="phase") # type: ignore
 
@@ -768,12 +827,12 @@ if __name__ == "__main__":
         type=str,
         help="one of: {}".format(", ".join(sorted(models.keys()))),
     )
-    parser.add_argument("-n", "--num-steps", default=40, type=int)
+    parser.add_argument("-n", "--num-steps", default=50, type=int)
     parser.add_argument("-b", "--batch-size", default=8, type=int)
     # parser.add_argument("-d", "--hidden-dim", default=2, type=int)
     parser.add_argument("-nn", "--nn-dim", default=48, type=int)
     parser.add_argument("-nc", "--nn-channels", default=2, type=int)
-    parser.add_argument("-lr", "--learning-rate", default=0.05, type=float)
+    parser.add_argument("-lr", "--learning-rate", default=0.04, type=float)
     parser.add_argument("-t", "--truncate", type=int)
     parser.add_argument("-p", "--print-shapes", action="store_true")
     parser.add_argument("--seed", default=0, type=int)
