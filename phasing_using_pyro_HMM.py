@@ -146,8 +146,6 @@ def validate_unphased_sequences(sequences, lengths):
 # target hidden dimension.
 #
 # Note that this is the "FHMM" model in reference [1].
-# kukedits:
-# made work for a reduced shape of the data: for only 1 tone out of 88
 def model_31(sequences, lengths, args, batch_size=None, include_prior=True, mode:Literal["train","validate","phase"]="train"):
 
     # corresponds to number of possible indices for probs_w and probs_x
@@ -448,6 +446,14 @@ def sample_MM(
     seed = 0,
     guide: Union[Callable, None] = None,
 ):
+    logging.info(f"sampling using {method} method")
+
+    the_length = lengths[0]
+    w_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
+    x_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
+    y_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
+    batches = []
+
     if method == 'infer_discrete':
         w_list, x_list, y_list, batches = pyro.infer.discrete.infer_discrete(  # type: ignore # "infer" *is* a known member of pyro
             model, temperature=0, first_available_dim=-3
@@ -457,10 +463,6 @@ def sample_MM(
 
         w_list, x_list, y_list = map(torch.stack           , (w_list, x_list, y_list))
         w_list, x_list, y_list = map(lambda tens: tens.T   , (w_list, x_list, y_list))
-        print(f"w_list shape: {w_list.shape}")
-        # print(f"type(batches): {type(batches)}")
-        # print(f"batches shape: {np.array(batches).shape}")
-        return w_list, x_list, y_list, batches
 
     elif method.startswith('MCMC'):
         raise NotImplementedError()
@@ -483,32 +485,144 @@ def sample_MM(
     elif method == 'predictive':
         if guide is None: raise ValueError('"predictive" method for sampling a trained HMM requires specifying guide')
         predictive_sample = Predictive(model, guide=guide, num_samples=1)(sequences, lengths, args=args, mode="phase")
-        the_length = lengths[0]
-        w_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
-        x_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
-        y_list = torch.zeros([the_length, len(sequences)], dtype=torch.int32)
 
         for i in range(the_length):
             w_list[i] = predictive_sample[f'w_{i}']
             x_list[i] = predictive_sample[f'x_{i}']
             y_list[i] = predictive_sample[f'y_{i}']
-        
+
         batches = [ torch.Tensor([i for i in range(len(sequences))]).to(torch.int32) ]
         w_list, x_list, y_list = w_list.T, x_list.T, y_list.T
 
-        print(f"w_list shape: {w_list.shape}")
-        # print(f"type(batches): {type(batches)}")
-        # print(f"batches shape: {np.array(batches).shape}")
-        return w_list, x_list, y_list, batches
-
     elif method == 'poutine_trace':
-        raise NotImplementedError()
-        trace = poutine.trace(model).get_trace(sequences,lengths, args=args, batch_size=args.batch_size, mode="phase")
-        return None, None, None, None
-    
-    else:
+        trace = poutine.trace(model).get_trace(sequences, lengths, args=args, mode="phase") # type: ignore # no, .trace is not None
+
+        for i in range(the_length):
+            w_list[i] = trace.nodes[f'w_{i}']['value']
+            x_list[i] = trace.nodes[f'x_{i}']['value']
+            y_list[i] = trace.nodes[f'y_{i}']['value']
+
+        batches: List[torch.Tensor] = [ trace.nodes['sequences']['value'] ]
+        w_list, x_list, y_list = w_list.T, x_list.T, y_list.T
+
+    else: # ¯\_(ツ)_/¯
         raise ValueError('supply a valid method')
-        return None, None, None, None # ¯\_(ツ)_/¯
+
+    logging.info(f"w_list shape: {w_list.shape}")
+    logging.info(f"x_list shape: {x_list.shape}")
+    logging.info(f"y_list shape: {y_list.shape}")
+    logging.info(f"batches: {batches}")
+    return w_list, x_list, y_list, batches
+
+
+def perform_sanity_checks(
+    w_list, x_list, y_list, batches, # generated sequences (model's output)
+    test_sequences, # unphased unimputed sequences (model's input)
+    valid_sequences, # corresponding correct full sequences
+):
+    logging.info("-" * 40)
+
+    logging.info(
+        "Sanity check I, comparing statistics from valid sequences and generated sequences:"
+    )
+
+    logging.info("proportion of alts in generated w_list and x_list:  {}\t{}".format(
+        np.mean(w_list.detach().numpy()),
+        np.mean(x_list.detach().numpy())
+    ))
+    logging.info("proportion of alts in corresponding full sequences: {}\t{}".format(
+        np.mean(valid_sequences[:,:,0].detach().numpy()),
+        np.mean(valid_sequences[:,:,1].detach().numpy())
+    ))
+
+
+    logging.info("")
+    logging.info(
+        "Sanity check II, checking that relation between x, w, and y holds: unphased(w_i, x_i) == y_i"
+    )
+
+    count_correct_wxy = np.zeros(len(test_sequences))
+    seq_length = len(test_sequences[0])
+
+    for sample_i in range(len(w_list)):
+        w_seq = w_list[sample_i]
+        x_seq = x_list[sample_i]
+        y_seq = y_list[sample_i]
+
+        wx_seq = pad_sequence([w_seq, x_seq])
+        unphased_wx_seq = np.array(unphase(wx_seq))
+        count_correct_wxy[sample_i] = np.count_nonzero(unphased_wx_seq == np.array(y_seq).astype(np.int32))
+
+    logging.info("number of matches between sampled y and w,x per each test sample:")
+    for sample_i in range(len(w_list)):
+        logging.info(f"sample #{sample_i}: {int(count_correct_wxy[sample_i])}/{seq_length} ({100*count_correct_wxy[sample_i]/seq_length}%)")
+
+
+def perform_accuracy_measurement(
+    w_list, x_list, y_list, batches, # generated sequences (model's output)
+    test_sequences, # unphased unimputed sequences (model's input)
+    valid_sequences, # corresponding correct full sequences
+):
+    logging.info(
+        "Measuring phasing accuracy by concordance"
+    )
+
+    accuracy, counttophase = test_accuracy(
+        test_phasing_accuracy_of_batch_by_concordance,
+        unphased_sequences=torch.squeeze(test_sequences),
+        full_sequences=torch.squeeze(valid_sequences),
+        w_list=w_list,
+        x_list=x_list,
+        batches=batches,
+    )
+
+    logging.info(f"number of sites to phase for all sequences: {counttophase}")
+    logging.info(f"accuracy for all sequences: {accuracy}")
+
+    total_tophase = counttophase.sum()
+    average_accuracy = sum([
+        accuracy[i]*(counttophase[i]/total_tophase) for i in range(len(accuracy)) if not np.isnan(accuracy[i])
+    ])
+    logging.info(f"total accuracy: {average_accuracy}")
+
+    logging.info("-" * 40)
+
+
+    logging.info(
+        "Measuring imputation accuracy by concordance (only for sites with at least 1 alt allele)"
+    )
+
+    unphased_sequences_arr = valid_sequences.detach().numpy()
+    unphased_sequences_arr_summed_genotypes = np.sum(unphased_sequences_arr, axis=-1)
+    unphased_sequences_arr_num_of_nonref_genotypes = unphased_sequences_arr_summed_genotypes[unphased_sequences_arr_summed_genotypes>0].shape[0]
+
+    logging.info(
+        "total non-ref sites: {} ({}%)".format(
+            unphased_sequences_arr_num_of_nonref_genotypes,
+            np.around(
+                100 * unphased_sequences_arr_num_of_nonref_genotypes/
+                    (unphased_sequences_arr.shape[0]*unphased_sequences_arr.shape[1])
+            , decimals=4)
+        ))
+
+    accuracy, counttoimp = test_accuracy(
+        test_imputation_accuracy_of_batch_by_concordance_of_non_ref,
+        unphased_sequences=torch.squeeze(test_sequences),
+        full_sequences=torch.squeeze(valid_sequences),
+        w_list=w_list,
+        x_list=x_list,
+        batches=batches,
+    )
+
+    logging.info(f"number of non-ref sites to impute for all sequences: {counttoimp}")
+    logging.info(f"accuracy for all sequences: {accuracy}")
+
+    total_toimp = counttoimp.sum()
+    average_accuracy = sum([
+        accuracy[i]*(counttoimp[i]/total_toimp) for i in range(len(accuracy)) if not np.isnan(accuracy[i])
+    ])
+    logging.info(f"total accuracy: {average_accuracy}")
+
 
 
 
@@ -555,17 +669,23 @@ def main(args):
 
     logging.info("Loading data")
 
-    # for this setup, with learning rate 0.05, more than 40 steps doesn't help
+    data = read_genomic_datasets(
+        test_samples = 40,
+        train_samples = 320,
+        sequence_length = 6000
+    )
+
+    # # for this setup, with learning rate 0.05, more than 40 steps doesn't help
     # data = read_genomic_datasets(
     #     test_samples = 8,
     #     train_samples = 256,
     #     sequence_length = 2000
     # )
-    data = read_genomic_datasets(
-        test_samples = 8,
-        train_samples = 256,
-        sequence_length = 1000
-    )
+    # data = read_genomic_datasets(
+    #     test_samples = 8,
+    #     train_samples = 256,
+    #     sequence_length = 1000
+    # )
     data_train = data["train"]
     sequences = data_train["sequences"]
     lengths = data_train["sequence_lengths"]
@@ -700,114 +820,26 @@ def main(args):
 
     sequences = torch.squeeze(data["test"]["sequences"])
     lengths = torch.squeeze(data["test"]["sequence_lengths"])
-    # w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='infer_discrete')
-    w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='predictive', guide=guide)
-    assert w_list is not None
-    assert x_list is not None
-    assert y_list is not None
-    assert batches is not None
 
 
-    # trace = poutine.trace(xs).get_trace(sequences,lengths, args=args, batch_size=args.batch_size, mode="phase") # type: ignore
+    for i in range(1,9):
+        logging.info(("="*20) + f"Phasing test: predictive (#{i})" + ("="*20))
+        w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='predictive', guide=guide)
+        perform_sanity_checks       (w_list, x_list, y_list, batches, sequences, valid_sequences)
+        perform_accuracy_measurement(w_list, x_list, y_list, batches, sequences, valid_sequences)
 
-    logging.info("-" * 40)
+    for i in range(1,9):
+        logging.info(("="*20) + f"Phasing test: infer_discrete (#{i})" + ("="*20))
+        w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='infer_discrete')
+        perform_sanity_checks       (w_list, x_list, y_list, batches, sequences, valid_sequences)
+        perform_accuracy_measurement(w_list, x_list, y_list, batches, sequences, valid_sequences)
 
-    logging.info(
-        "Sanity check I, comparing statistics from valid sequences and generated sequences:"
-    )
+    for i in range(1,9):
+        logging.info(("="*20) + f"Phasing test: poutine_trace (#{i})" + ("="*20))
+        w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='poutine_trace', guide=guide)
+        perform_sanity_checks       (w_list, x_list, y_list, batches, sequences, valid_sequences)
+        perform_accuracy_measurement(w_list, x_list, y_list, batches, sequences, valid_sequences)
 
-    logging.info("proportion of alts in w_list and x_list: {},\t{}".format(
-        np.mean(w_list.detach().numpy()),
-        np.mean(x_list.detach().numpy())
-    ))
-    logging.info("proportion of alts in full_sequences:    {},\t{}".format(
-        np.mean(valid_sequences[:,:,0].detach().numpy()),
-        np.mean(valid_sequences[:,:,1].detach().numpy())
-    ))
-
-    logging.info("")
-    logging.info(
-        "Sanity check II, checking that relation between x, w, and y holds: unphased(w_i, x_i) == y_i"
-    )
-
-    count_correct_wxy = np.zeros(len(sequences))
-    seq_length = len(sequences[0])
-
-    for sample_i in range(len(w_list)):
-        w_seq = w_list[sample_i]
-        x_seq = x_list[sample_i]
-        y_seq = y_list[sample_i]
-
-        wx_seq = pad_sequence([w_seq, x_seq])
-        unphased_wx_seq = np.array(unphase(wx_seq))
-        count_correct_wxy[sample_i] = np.count_nonzero(unphased_wx_seq == np.array(y_seq).astype(np.int32))
-
-    logging.info("number of matches between sampled y and w,x per each test sample:")
-    for sample_i in range(len(w_list)):
-        logging.info(f"sample #{sample_i}: {int(count_correct_wxy[sample_i])}/{seq_length} ({100*count_correct_wxy[sample_i]/seq_length}%)")
-    
-
-    logging.info("-" * 40)
-
-    logging.info(
-        "Measuring phasing accuracy by concordance"
-    )
-
-    accuracy, counttophase = test_accuracy(
-        test_phasing_accuracy_of_batch_by_concordance,
-        unphased_sequences=torch.squeeze(data["test"]["sequences"]),
-        full_sequences=torch.squeeze(data["valid"]["sequences"]),
-        w_list=w_list,
-        x_list=x_list,
-        batches=batches,
-    )
-
-    logging.info(f"number of sites to phase for all sequences: {counttophase}")
-    logging.info(f"accuracy for all sequences: {accuracy}")
-
-    total_tophase = counttophase.sum()
-    average_accuracy = sum([
-        accuracy[i]*(counttophase[i]/total_tophase) for i in range(len(accuracy)) if not np.isnan(accuracy[i])
-    ])
-    logging.info(f"total accuracy: {average_accuracy}")
-
-    logging.info("-" * 40)
-
-
-    logging.info(
-        "Measuring imputation accuracy by concordance (only for sites with at least 1 alt allele)"
-    )
-
-    unphased_sequences_arr = data['valid']['sequences'].detach().numpy()
-    unphased_sequences_arr_summed_genotypes = np.sum(unphased_sequences_arr, axis=-1)
-    unphased_sequences_arr_num_of_nonref_genotypes = unphased_sequences_arr_summed_genotypes[unphased_sequences_arr_summed_genotypes>0].shape[0]
-
-    logging.info(
-        "total non-ref sites: {} ({}%)".format(
-            unphased_sequences_arr_num_of_nonref_genotypes,
-            np.around(
-                100 * unphased_sequences_arr_num_of_nonref_genotypes/
-                    (unphased_sequences_arr.shape[0]*unphased_sequences_arr.shape[1])
-            , decimals=4)
-        ))
-
-    accuracy, counttoimp = test_accuracy(
-        test_imputation_accuracy_of_batch_by_concordance_of_non_ref,
-        unphased_sequences=torch.squeeze(data["test"]["sequences"]),
-        full_sequences=torch.squeeze(data["valid"]["sequences"]),
-        w_list=w_list,
-        x_list=x_list,
-        batches=batches,
-    )
-
-    logging.info(f"number of non-ref sites to impute for all sequences: {counttoimp}")
-    logging.info(f"accuracy for all sequences: {accuracy}")
-
-    total_toimp = counttoimp.sum()
-    average_accuracy = sum([
-        accuracy[i]*(counttoimp[i]/total_toimp) for i in range(len(accuracy)) if not np.isnan(accuracy[i])
-    ])
-    logging.info(f"total accuracy: {average_accuracy}")
 
 
     return None
