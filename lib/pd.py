@@ -1,7 +1,10 @@
 import io
 import gzip
-
-import magic
+import sys
+if sys.platform == 'win32':
+    from winmagic import magic
+else:
+    import magic
 import pandas as pd
 
 
@@ -9,6 +12,7 @@ import pandas as pd
 Wrapper around pd.read_csv() that reads table from vcf, vcf.gz, tsv, or tsv.gz
 with an arbitrary length of a vcf header
 """
+
 def pd_read_vcf(filepath: str):
 
     mime: str = magic.from_file(filepath, mime=True)
@@ -29,4 +33,3 @@ def pd_read_vcf(filepath: str):
     filepath_o.close()
 
     return pd.read_csv(filepath, header=num_of_vcf_header_lines, sep="\t")
-

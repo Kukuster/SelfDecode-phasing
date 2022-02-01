@@ -1,18 +1,18 @@
 from typing import Literal, Union
-import jax.numpy as jnp
+#import jax.numpy as jnp
 import numpy as np
 import torch
 
-from lib.pd import pd_read_vcf
+from pd import pd_read_vcf
 
 
 
-DATA_DIR="/home/ubuntu/files"
+DATA_DIR="E:\\Nikita\\dev_data\\"
 
 num_of_sites = 14635 # btw
-test_dataset_filepath  = f"{DATA_DIR}/400_random_samples_BP0-1000000.80-test-samples_EUROFINS-masked_unimputed-unphased_int-data.tsv.gz"
-train_dataset_filepath = f"{DATA_DIR}/400_random_samples_BP0-1000000.320-ref-samples.vcf.gz"
-valid_dataset_filepath = f"{DATA_DIR}/400_random_samples_BP0-1000000.80-test-samples.vcf.gz"
+test_dataset_filepath  = f"{DATA_DIR}400_random_samples_BP0-1000000.80-test-samples_EUROFINS-masked_unimputed-unphased_int-data.tsv.gz"
+train_dataset_filepath = f"{DATA_DIR}400_random_samples_BP0-1000000.320-ref-samples.vcf.gz"
+valid_dataset_filepath = f"{DATA_DIR}400_random_samples_BP0-1000000.80-test-samples.vcf.gz"
 
 
 
