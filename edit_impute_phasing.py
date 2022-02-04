@@ -114,7 +114,10 @@ unphasing_dict = {
 # works on batches of genotypes, e.g.:
 # [(0,1), (0,0), (1,0)] -->  [2, 1, 2]
 def unphase(genotype: torch.Tensor) -> torch.Tensor:
-    return genotype.sum(axis=-1)+1 # type: ignore # it's actually ok to add Tensor and integer
+    return genotype.sum(axis=-1) # type: ignore # it's actually ok to add Tensor and integer
+
+def translate_to_impute(genotype: torch.Tensor) -> torch.Tensor:
+    return genotype - 1
 
 
 def validate_full_sequences(sequences, lengths):
@@ -150,50 +153,47 @@ def validate_unphased_sequences(sequences, lengths):
 #
 # Note that this is the "FHMM" model in reference [1].
 def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
-             mode: Literal["train", "validate", "phase"] = "train"):
+             mode: Literal["train", "validate", "phase", "impute"] = "train"):
     # corresponds to number of possible indices for probs_w and probs_x
     #         and to number of possible values of w and x vars
     hidden_dim = 2  # for both w and x can be 0 and 1
-    observed_dim = 4  # can be 0 (unknown), 1 (0/0), 2 (0/1), 3 (1/1)
+    observed_dim = 3  # can be 0 (unknown), 1 (0/0), 2 (0/1), 3 (1/1)
 
-    with poutine.mask(mask=include_prior):
 
-        """
+    """
         Parameters for prior probabilities of finding ref (0) or alt (1) after ref (0) or alt (1).
         Parameters were roughly set in accord to two assumptions:
          - approximate occurence of 1s in sequences is around 7%
          - 1s tend to hang out together.
 
         In fact, these two variables can be measured before training the model.
-        """
-        p_0_followedby_0 = 0.95
-        p_0_followedby_1 = 0.05
-        p_1_followedby_0 = 0.95
-        p_1_followedby_1 = 0.05
+    """
+    p_0_followedby_0 = 0.95
+    p_0_followedby_1 = 0.05
+    p_1_followedby_0 = 0.95
+    p_1_followedby_1 = 0.05
 
-        w_to_w_probs = torch.Tensor([
+    w_to_w_probs = torch.Tensor([
             [p_0_followedby_0, p_0_followedby_1],
             [p_1_followedby_0, p_1_followedby_1],
-        ])
-        x_to_x_probs = torch.Tensor([
+    ])
+    x_to_x_probs = torch.Tensor([
             [p_0_followedby_0, p_0_followedby_1],
             [p_1_followedby_0, p_1_followedby_1],
-        ])
-        assert w_to_w_probs.shape[-1] == hidden_dim
-        assert x_to_x_probs.shape[-1] == hidden_dim
+    ])
+    assert w_to_w_probs.shape[-1] == hidden_dim
+    assert x_to_x_probs.shape[-1] == hidden_dim
 
-        probs_w = pyro.param(
-            "probs_w", dist.Dirichlet(w_to_w_probs), constraint = constraints.simplex
+    probs_w = pyro.param(
+            "probs_w", w_to_w_probs, constraint = constraints.simplex
             # type: ignore # "Dirichlet" *is* a known member of module dist
-        )
-        probs_x = pyro.param(
-            "probs_x", dist.Dirichlet(x_to_x_probs), constraint = constraints.simplex
+    )
+    probs_x = pyro.param(
+            "probs_x", x_to_x_probs, constraint = constraints.simplex
             # type: ignore # "Dirichlet" *is* a known member of module dist
-        )
+    )
 
-        probs_z = [[0.97745,0.02255,0,0],[0.97745,0,0.02255,0],[0.97745,0,0,0.02255]]
-
-        """
+    """
         Parameter for prior probability that one of two calls was incorrect
         Literally, prior probability we will observe an unphased genotype that will differ by one call
         from the real underlying genotype. i.e.:
@@ -204,20 +204,20 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
                 P( '0/0' | '0|1' )  = 
                 P( '1/1' | '1|0' )  = 
                 P( '1/1' | '0|1' )
-        """
-        p_1 = 2e-4
+    """
+    p_1 = 2e-4
 
-        """
+    """
         Parameter for prior probability that both two calls were incorrect
         Literally, prior probability we will observe an unphased genotype that will differ by both calls
         from the real underlying genotype. i.e.:
             p_2  = 
                 P( '0/0' | '1|1' )  = 
                 P( '1/1' | '0|0' )
-        """
-        p_2 = 2e-5
+    """
+    p_2 = 2e-5
 
-        """
+    """
         Parameter for prior probability that both two calls were correct!
         Literally, prior probability we will observe an unphased genotype that has the same number of alt calls
         as the real underlying genotype. i.e.:
@@ -226,10 +226,10 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
                 P( '0/1' | '0|1' )  = 
                 P( '1/0' | '1|0' )  = 
                 P( '1/1' | '1|1' )
-        """
-        p_0 = 1 -  p_1 - p_2
+    """
+    p_0 = 1 -  p_1 - p_2
 
-        """
+    """
         Parameter for prior probability that it's a "." (missing call) given a full genotype
         Literally, prior probability we will observe an unphased genotype that has the same number of alt calls
         as the real underlying genotype. i.e.:
@@ -238,22 +238,22 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
                 P( '.' | '0|1' )  = 
                 P( '.' | '1|0' )  = 
                 P( '.' | '1|1' )
-        """
+    """
 
-        # observation not caring where either of the 0 or 1's came from to give observed 'missing', 0/0', '0/1', '1/1'
-        wx_to_y_probs = torch.Tensor([
+    # observation not caring where either of the 0 or 1's came from to give observed 'missing', 0/0', '0/1', '1/1'
+    wx_to_y_probs = torch.Tensor([
             [[p_0, p_1, p_2, ],
              [p_1, p_0, p_1, ]],
             [[p_1, p_0, p_1, ],
              [p_2, p_1, p_0, ]],
-        ])
-        assert wx_to_y_probs.shape[-1] == observed_dim
+    ])
+    assert wx_to_y_probs.shape[-1] == observed_dim
 
-        probs_y = pyro.param(
+    probs_y = pyro.param(
             "probs_y",
-            dist.Dirichlet(wx_to_y_probs),
+            wx_to_y_probs,
             constraint = constraints.simplex,# type: ignore # "Beta" *is* a known member of module dist
-        )
+    )
 
     def train_on(full_sequences, lengths):
         validate_full_sequences(full_sequences, lengths)
@@ -363,6 +363,9 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
 
         return probs_y, probs_w, probs_x, w_seq, x_seq, y_seq, batches
 
+
+
+
     def impute_phase(sparse_sequences, lengths):
         validate_unphased_sequences(sparse_sequences, lengths)
         num_sequences, max_length = map(int, sparse_sequences.shape)
@@ -404,18 +407,16 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
                     obs_mask[obs_mask != 0.] = 1
                     # 0 means missing genotype data, so set to 0 to exclude in obs
                     obs_mask[obs_mask == 0.] = 0
+                    obs_mask = obs_mask.to(torch.bool)
                     y = pyro.sample(
                         "y_{}".format(t),
                         dist.Categorical(probs_y[w, x]),
                         # type: ignore # "Categorical" *is* a known member of module dist
                         infer={"enumerate":"parallel"},
-                    )
-                    y_seq.append(y)
-                    z = pyro.sample(
-                        "z_{}".format(t),
-                        dist.Categorical(probs_z[y]),
-                        obs=sparse_sequences[batch, t],
+                        obs=(sparse_sequences[batch, t]-torch.minimum(torch.ones(sparse_sequences[batch,t].shape),sparse_sequences[batch, t])).to(torch.int64),
+                        obs_mask=obs_mask,
                     ).to(torch.float32)
+                    y_seq.append(y)
 
         return probs_y, probs_w, probs_x, w_seq, x_seq, y_seq, batches
 
@@ -426,6 +427,8 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
         return validate(sequences, lengths)
     elif mode == "phase":
         return phase(sequences, lengths)
+    elif mode == "impute":
+        return impute_phase(sequences,lengths)
     else:
         return None  # ¯\_(ツ)_/¯
 
@@ -506,6 +509,7 @@ def sample_MM(
                         'poutine_trace', 'predictive'] = 'infer_discrete',
         seed=0,
         guide: Union[Callable, None] = None,
+        mode="phase"
 ):
     logging.info(f"sampling using {method} method")
 
@@ -520,7 +524,7 @@ def sample_MM(
             # type: ignore # "infer" *is* a known member of pyro
             model, temperature=0, first_available_dim=-3
         )(
-            sequences, lengths, args=args, mode="phase"
+            sequences, lengths, args=args, mode=mode
         )
 
         print("probs_y: ", probs_y)
@@ -895,8 +899,8 @@ def main(args):
         "Phasing {} test sequences".format(len(data["test"]["sequences"]))
     )
 
-    sequences = torch.squeeze(data["test"]["sequences"])
-    lengths = torch.squeeze(data["test"]["sequence_lengths"])
+    sequences = unphase(data["valid"]["sequences"])
+    lengths = data["valid"]["sequence_lengths"]
 
     for i in range(1, 9):
         logging.info(("=" * 20) + f"Phasing test: predictive (#{i})" + ("=" * 20))
@@ -906,18 +910,14 @@ def main(args):
 
     for i in range(1, 9):
         logging.info(("=" * 20) + f"Phasing test: infer_discrete (#{i})" + ("=" * 20))
-        w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='infer_discrete')
+        w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='infer_discrete',mode="phase")
         perform_sanity_checks(w_list, x_list, y_list, batches, sequences, valid_sequences)
+    sequences = torch.squeeze(data["test"]["sequences"])
+    lengths = torch.squeeze(data["test"]["sequence_lengths"])
+    for i in range(1,9):
+        logging.info(("=" * 20) + f"Impute test: infer_discrete (#{i})" + ("=" * 20))
+        w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='infer_discrete',mode="impute")
         perform_accuracy_measurement(w_list, x_list, y_list, batches, sequences, valid_sequences)
-
-    for i in range(1, 9):
-        logging.info(("=" * 20) + f"Phasing test: poutine_trace (#{i})" + ("=" * 20))
-        w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='poutine_trace',
-                                                    guide=guide)
-        perform_sanity_checks(w_list, x_list, y_list, batches, sequences, valid_sequences)
-        perform_accuracy_measurement(w_list, x_list, y_list, batches, sequences, valid_sequences)
-
-    return None
 
 
 if __name__ == "__main__":

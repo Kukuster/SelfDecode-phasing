@@ -796,6 +796,11 @@ def main(args):
     for name in pyro.get_param_store().get_all_param_names():
         print(name, pyro.param(name).data.numpy())
 
+    print("torch parameters")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print (name," ", param.data)
+
     # We evaluate on the entire training dataset,
     # excluding the prior term so our results are comparable across models.
     train_loss = elbo.loss(model, guide, sequences, lengths, args, include_prior=False, mode="validate") #this runs from the guide

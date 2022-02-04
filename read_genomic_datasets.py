@@ -10,9 +10,9 @@ from pd import pd_read_vcf
 DATA_DIR="E:\\Nikita\\dev_data\\"
 
 num_of_sites = 14635 # btw
-test_dataset_filepath  = f"{DATA_DIR}400_random_samples_BP0-1000000.80-test-samples_EUROFINS-masked_unimputed-unphased_int-data.tsv.gz"
-train_dataset_filepath = f"{DATA_DIR}400_random_samples_BP0-1000000.320-ref-samples.vcf.gz"
-valid_dataset_filepath = f"{DATA_DIR}400_random_samples_BP0-1000000.80-test-samples.vcf.gz"
+test_dataset_filepath  = f"{DATA_DIR}400_random_samples_BP0-1000000.80-test-samples_EUROFINS-masked_unimputed-unphased_int-data.tsv.gz" # testing the imputing as input
+train_dataset_filepath = f"{DATA_DIR}400_random_samples_BP0-1000000.320-ref-samples.vcf.gz" # training
+valid_dataset_filepath = f"{DATA_DIR}400_random_samples_BP0-1000000.80-test-samples.vcf.gz" # ground truth for imputing, test the phasing on this
 
 
 
