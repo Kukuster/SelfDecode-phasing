@@ -356,8 +356,8 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
                         "y_{}".format(t),
                         dist.Categorical(probs_y[w, x]),
                         # type: ignore # "Categorical" *is* a known member of module dist
-                        obs=sparse_sequences[batch, t],
-                        obs_mask=obs_mask
+                        obs=(sparse_sequences[batch, t]-torch.minimum(torch.ones(sparse_sequences[batch,t].shape),sparse_sequences[batch, t])).to(torch.int64),
+                        obs_mask=obs_mask,
                     ).to(torch.float32)
                     y_seq.append(y)
 
@@ -412,7 +412,7 @@ def model_31(sequences, lengths, args, batch_size=None, include_prior=True,
                         "y_{}".format(t),
                         dist.Categorical(probs_y[w, x]),
                         # type: ignore # "Categorical" *is* a known member of module dist
-                        infer={"enumerate":"parallel"},
+                        #infer={"enumerate":"parallel"},
                         obs=(sparse_sequences[batch, t]-torch.minimum(torch.ones(sparse_sequences[batch,t].shape),sparse_sequences[batch, t])).to(torch.int64),
                         obs_mask=obs_mask,
                     ).to(torch.float32)
@@ -473,7 +473,7 @@ def test_imputation_accuracy_of_batch_by_concordance_of_non_ref(unphased_sequenc
         for site in range(len(full_sequences[0])):
             genotype_tuple = tuple(full_sequences[seq_i][site].tolist())
             # test only sites where we need to impute and the true genotype has at least 1 alt
-            if unphased_sequences[seq_i][site] == 0 and sum(genotype_tuple) > 0:
+            if unphased_sequences[seq_i][site] > 0 and sum(genotype_tuple) > 0:
                 count_total_toimp += 1
                 if genotype_tuple == (w_list[i][site], x_list[i][site]):
                     count_imped_correctly += 1
@@ -527,9 +527,6 @@ def sample_MM(
             sequences, lengths, args=args, mode=mode
         )
 
-        print("probs_y: ", probs_y)
-        print("probs_w: ", probs_w)
-        print("probs_x: ", probs_x)
 
         w_list, x_list, y_list = map(torch.stack, (w_list, x_list, y_list))
         w_list, x_list, y_list = map(lambda tens: tens.T, (w_list, x_list, y_list))  #### looks fine for infer_discrete
@@ -555,7 +552,6 @@ def sample_MM(
     elif method == 'predictive':
         if guide is None: raise ValueError('"predictive" method for sampling a trained HMM requires specifying guide')
         predictive_sample = Predictive(model, guide=guide, num_samples=1)(sequences, lengths, args=args, mode="phase")
-
         for i in range(the_length):
             w_list[i] = predictive_sample[f'w_{i}']
             x_list[i] = predictive_sample[f'x_{i}']
@@ -715,6 +711,7 @@ models = {
 
 
 def main(args):
+    pyro.clear_param_store()
     model = models[args.model]
     # model = og_model_1
 
@@ -873,6 +870,21 @@ def main(args):
     )
     valid_sequences = sequences = torch.squeeze(data["valid"]["sequences"])
     valid_lengths = lengths = torch.squeeze(data["valid"]["sequence_lengths"])
+
+    for epoch in range(5):
+        for step in range(args.num_steps):
+            tn = time.time()
+            loss = svi.step(sequences, lengths, args=args, batch_size=args.batch_size, mode="validate")
+            tnp1 = time.time()
+            logging.info("{: >5d}\t{}\t {} s \t {} s".format(
+                step,
+                round(loss / num_observations, 5),  # type: ignore
+                round(tnp1 - tn, 3),
+                round(tnp1 - t0, 3)
+            ))
+
+    #run extra training on this dataset
+
     # sequences = leave_only_first_played_note(sequences, present_notes)
     if args.truncate:
         lengths = lengths.clamp(max=args.truncate)
@@ -899,14 +911,20 @@ def main(args):
         "Phasing {} test sequences".format(len(data["test"]["sequences"]))
     )
 
-    sequences = unphase(data["valid"]["sequences"])
-    lengths = data["valid"]["sequence_lengths"]
+    sequences = torch.squeeze(data["test"]["sequences"])
+    lengths = torch.squeeze(data["test"]["sequence_lengths"])
+
 
     for i in range(1, 9):
         logging.info(("=" * 20) + f"Phasing test: predictive (#{i})" + ("=" * 20))
         w_list, x_list, y_list, batches = sample_MM(model, sequences, lengths, args, method='predictive', guide=guide)
         perform_sanity_checks(w_list, x_list, y_list, batches, sequences, valid_sequences)
         perform_accuracy_measurement(w_list, x_list, y_list, batches, sequences, valid_sequences)
+
+    sequences = unphase(data["valid"]["sequences"])
+    lengths = data["valid"]["sequence_lengths"]
+
+    print(guide.median(sequences, lengths, args=args, batch_size=args.batch_size, mode="phase"))
 
     for i in range(1, 9):
         logging.info(("=" * 20) + f"Phasing test: infer_discrete (#{i})" + ("=" * 20))
